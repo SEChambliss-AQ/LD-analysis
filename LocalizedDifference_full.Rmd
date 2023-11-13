@@ -1,0 +1,1864 @@
+---
+title: "Integrated GSV BART setup"
+author: "Sarah Chambliss"
+date: '2022-07-24'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(sf)
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+library(ggExtra)
+library(ggmap)
+
+knitr::opts_chunk$set(echo = TRUE)
+ggplot2::theme_set(ggplot2::theme_bw())
+
+```
+
+## 0.1 Pre-analysis data handling: Load data and make it all on consistent grid
+This is provided for transparency but does not need to be run -- the processed data may be loaded from 
+load("./bartMachine R objects/clean_workspace.RData")
+
+### 0.1.1 First, bring in the premade grid data
+
+This grid data includes the density of pollution-related features from OpenStreetMap (as detailed in the associated publication) and mobile monitoring-based estimates of four pollutants: NO, NO2, UFP, and BC
+
+```{r load GSV grid}
+grid_model_data <- readRDS("./gridded_OSM_GSV.RDS")
+```
+
+
+### 0.1.2 Second, use tidycensus to retrieve block group geometry and population data
+
+Tidy-up/correction step: use census data to get block-level populations
+
+```{r get pop data from tidycensus}
+library(tidycensus)
+# to run this, you must get an API key for the census -- see tidycensus documentation
+#census_api_key("your key here", install = T)
+
+ACS_2016 <- load_variables(2016, "acs5", cache = TRUE)
+pop_groups <- ACS_2016 %>%
+  filter(str_detect(ACS_2016$name, "B03002"))
+
+CA_bg_pops <- get_acs(geography = "block group",
+        variables = c(pop_groups$name, #Race/ethnicity
+                      "B17001_001","B17001_002" #Population under poverty
+                      ),
+        state = "California",
+        year = 2016,
+        geometry = T,
+        output = "wide")
+```
+
+```{r cut pop data to GSV bounds}
+Bound_bg_pops <- CA_bg_pops %>% st_transform(st_crs(4326)) %>% 
+  st_filter(st_boundary(grid_model_data %>%
+                          st_transform(st_crs(4326))))
+
+grid_bounds <- st_bbox(grid_model_data)
+ba_grid_bounds <- st_bbox(grid_model_data %>% 
+                            dplyr::filter(!(neighborhood %in% "Sebastopol")))
+
+# library("ggmap")
+# ggmap::register_stadiamaps("YOUR-API-KEY-HERE", write = T)
+# #This needs to be updated now that stamenmaps have been moved to Stadia
+# However, the data read in 
+
+# # (https://docs.stadiamaps.com/guides/migrating-from-stamen-map-tiles/)
+# GSV_bgkdmap <- get_stamenmap(bbox=c(left = as.numeric(grid_bounds$xmin),
+#                                     bottom = as.numeric(grid_bounds$ymin),
+#                                     right = as.numeric(grid_bounds$xmax),
+#                                     top = as.numeric(grid_bounds$ymax)),
+#                              zoom = 8,
+#                              maptype = "terrain-background")
+# ba_bkgdmap <- get_stamenmap(bbox=c(left = as.numeric(ba_grid_bounds$xmin),
+#                                     bottom = as.numeric(ba_grid_bounds$ymin),
+#                                     right = as.numeric(ba_grid_bounds$xmax),
+#                                     top = as.numeric(ba_grid_bounds$ymax)),
+#                              zoom = 10,
+#                              maptype = "terrain-background")
+# 
+# ggmap(GSV_bgkdmap) +
+#       geom_sf(data = Bound_bg_pops, fill = NA, lwd = .1, color = "black", inherit.aes = FALSE)
+
+# Bound_bg_clean <- grid_model_data %>% 
+#   group_by(neighborhood) %>% 
+#   summarize()
+# 
+# ggmap(GSV_bgkdmap) +
+#       geom_sf(data = Bound_bg_clean, fill = NA, lwd = .1, color = "black", inherit.aes = FALSE)
+
+GSV_counties <- unique(substring(Bound_bg_pops$GEOID,3,5))
+```
+
+### 0.1.3 Third, bring in the two block group concentration datasets from CACES
+
+```{r load downloaded CACES}
+#These block group predictions can be downloaded from 
+# https://www.caces.us/data
+CACES_UFP_download <- read.csv("./CACES_UFP.csv")
+CACES_criteria_download <- read.csv("./CACES_criteria.csv")
+
+CACES_wide <- pivot_wider(CACES_UFP_download, 
+                          names_from = pollutant, values_from = pred_wght) %>%
+  dplyr::select(c("fips","pnc")) %>% 
+  left_join(.,
+    pivot_wider(CACES_criteria_download,
+                names_from = pollutant, values_from = pred_wght),
+    by = "fips") %>% 
+  mutate(GEOID = paste0("0",fips))
+```
+
+### 0.2 Resample the CACES and ACS data for grids
+
+```{r}
+BG_ACS_CACES <- CA_bg_pops %>% 
+  st_transform(st_crs(4326)) %>% #Bound_bg_pops %>% 
+  left_join(., CACES_wide, by = "GEOID") %>% 
+  mutate(WNH_pop = B03002_003E,
+        BNH_pop = B03002_004E,
+        HL_pop = B03002_012E,
+        Asn_pop = B03002_006E,
+        Other_pop = B03002_005E + B03002_007E + B03002_008E + B03002_009E,
+        Total = B03002_001E,
+        Pov_denom = B17001_001E,
+        Pov_total = B17001_002E#,
+        # chk = WNH_pop + BNH_pop + HL_pop + Asn_pop + Other_pop
+        ) %>% 
+  dplyr::select(c(GEOID,fips:Pov_total))
+
+# ggmap(GSV_bgkdmap) +
+#       geom_sf(data = BG_ACS_CACES, aes(fill = Total), alpha = .9,
+#           lwd = 0, color = NA, inherit.aes = F)
+# 
+# ggmap(ba_bkgdmap) +
+#       geom_sf(data = BG_ACS_CACES, aes(fill = no2), alpha = .9,
+#           lwd = 0, color = NA, inherit.aes = F)
+
+# NO2_domain_LUR_map <- ggmap(GSV_bgkdmap) +
+#       geom_sf(data = BG_ACS_CACES, aes(fill = no2), alpha = 1,
+#           lwd = 0.001, color = NA, inherit.aes = F) +
+#       geom_sf(data = Bound_bg_clean, fill = NA, lwd = .2, color = "yellow", inherit.aes = FALSE) +
+#   theme(axis.text = element_blank(),
+#         axis.ticks = element_blank(),
+#         axis.title = element_blank())
+# ggsave("../Graphics/Maps/NO2_CACES_map.pdf",
+#        NO2_domain_LUR_map,
+#        scale=5, height = 2, width = 1, units = "in")
+
+
+# ggmap(ba_bkgdmap) +
+#       geom_sf(data = BG_ACS_CACES %>% 
+#                 mutate(ufp = pnc/1000), aes(fill = ufp), alpha = .9,
+#           lwd = 0, color = NA, inherit.aes = F) #+
+#         # geom_sf(data = BG_ACS_CACES %>% 
+#         #           dplyr::filter(Total == 0), fill = "red", alpha = .9,
+#         #   lwd = 0, color = NA, inherit.aes = F)
+# 
+# UFP_domain_LUR_map <- ggmap(GSV_bgkdmap) +
+#       geom_sf(data = BG_ACS_CACES %>% 
+#                 mutate(ufp = pnc/1000), aes(fill = ufp), alpha = 1,
+#           lwd = 0.001, color = NA, inherit.aes = F) +
+#       geom_sf(data = Bound_bg_clean, fill = NA, lwd = .2, color = "yellow", inherit.aes = FALSE) +
+#   theme(axis.text = element_blank(),
+#         axis.ticks = element_blank(),
+#         axis.title = element_blank())
+# ggsave("../Graphics/Maps/UFP_CACES_map.pdf",
+#        UFP_domain_LUR_map,
+#        scale=5, height = 2, width = 1, units = "in")
+
+```
+
+
+```{r}
+CACES_gridded <- grid_model_data %>% 
+  st_interpolate_aw(BG_ACS_CACES %>%
+                      dplyr::select(c("pnc","no2")),
+                    .,
+                    extensive = F)
+ACS_gridded <- grid_model_data %>% 
+  st_interpolate_aw(BG_ACS_CACES %>% 
+                      dplyr::select(WNH_pop:Total),
+                    .,
+                    extensive = T)
+
+grid_full <- grid_model_data %>% 
+        st_join(., CACES_gridded,
+                st_equals) %>% 
+        st_join(., ACS_gridded,
+                st_equals) %>%
+  mutate(pnc = pnc/1000) %>% 
+  dplyr::rename(NO2_CACES = "no2",
+                UFP_CACES = "pnc") %>% 
+  mutate(NO2_error = NO2-NO2_CACES,
+         UFP_error = UFP-UFP_CACES)
+
+```
+
+### 0.3 Visualize LD differences among racial/ethnic groups
+
+```{r}
+exposure_longform <- grid_full %>% 
+  st_drop_geometry() %>% 
+  mutate(NO2_error = NO2-NO2_CACES,
+         UFP_error = UFP-UFP_CACES) %>% 
+  dplyr::select(c("index","NO2_error","UFP_error")) %>% 
+  pivot_longer(cols = c("NO2_error","UFP_error"), names_to = "pollutant", values_to = "error") %>% 
+  left_join(., grid_full %>% 
+              st_drop_geometry() %>%
+              dplyr::select(c("index",WNH_pop:Other_pop)),
+            by = "index") %>% 
+  pivot_longer(cols = WNH_pop:Other_pop, names_to = "population", values_to = "weight")
+
+ggplot(exposure_longform) +
+  geom_boxplot(aes(x = error, y = population, color = population, weight = weight),
+               # outlier.shape = NA
+               ) +
+  facet_wrap(~pollutant, scales = "free") +
+  coord_flip() +
+  theme( axis.text.x = element_text( angle = 90, hjust = 1, vjust = 0.5)
+         )
+
+NO2_popbox <- ggplot(exposure_longform %>% 
+         dplyr::filter(pollutant == "NO2_error")) +
+  geom_boxplot(aes(x = error, y = population, color = population, weight = weight),
+               # outlier.shape = NA
+               ) +
+  coord_flip() +
+  coord_flip(c(-7.5,7.5)) +
+  theme( axis.text.x = element_text( angle = 90, hjust = 1, vjust = 0.5)
+         )
+
+UFP_popbox <- ggplot(exposure_longform %>% 
+         dplyr::filter(pollutant == "UFP_error")) +
+  geom_boxplot(aes(x = error, y = population, color = population, weight = weight),
+               # outlier.shape = NA
+               ) +
+  coord_flip(c(-10,30)) +
+  theme( axis.text.x = element_text( angle = 90, hjust = 1, vjust = 0.5)
+         )
+# 
+# ggsave("../Graphics/Scatter and distribution/Popwtd_box_legend.pdf",
+#        NO2_popbox, scale=2, height = 2, width = 1, units = "in")
+# ggsave("../Graphics/Scatter and distribution/Popwtd_box_NO2.pdf",
+#        NO2_popbox, scale=2, height = 2, width = 2, units = "in")
+# ggsave("../Graphics/Scatter and distribution/Popwtd_box_UFP.pdf",
+#        UFP_popbox, scale=2, height = 2, width = 2, units = "in")
+```
+
+### 0.4 Clear workspace
+```{r}
+rm(CA_bg_pops)
+rm(CACES_criteria_download)
+rm(CACES_UFP_download)
+rm(CACES_gridded)
+rm(CACES_wide)
+gc()
+```
+
+```{r}
+save.image("./bartMachine R objects/clean_workspace.RData")
+```
+
+#----Start of analysis---- 
+```{r}
+load("./bartMachine R objects/clean_workspace.RData")
+```
+
+##Results 1: Characterizing "localized difference" 
+###1.1 Comparison of LUR with MM
+
+```{r}
+grid_full %>% 
+  mutate(target=NO2) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            tenth = quantile(target,.1),
+            ninetieth = quantile(target,.9))
+grid_full %>% 
+  mutate(target=NO2_CACES) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            tenth = quantile(target,.1),
+            ninetieth = quantile(target,.9))
+grid_full %>% 
+  mutate(target=UFP) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            tenth = quantile(target,.1),
+            ninetieth = quantile(target,.9))
+grid_full %>% 
+  mutate(target=UFP_CACES) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            tenth = quantile(target,.1),
+            ninetieth = quantile(target,.9))
+```
+
+```{r NO2 scatter}
+NO2_scatter <- ggplot(grid_full, aes(x = NO2_CACES, y = NO2)) +
+  geom_point(color = "#5ab4ac", alpha = .4, size = .2) +
+  # geom_smooth(method='lm') +
+  geom_abline(slope=1, intercept=0) +
+  xlim(range(grid_full$NO2, na.rm = T)) +
+  ylim(range(grid_full$NO2, na.rm = T)) +
+  theme(aspect.ratio = 1)
+
+RPvMM_scatter_no2 <- ggMarginal(NO2_scatter, type="density")
+summary(lm(data=grid_full, formula = NO2~NO2_CACES))
+# ggsave("../Graphics/Scatter and distribution/RPvMM_scatter_no2.pdf",
+#        RPvMM_scatter_no2, units = "in", height = 3, width = 3, scale = 1)
+```
+
+```{r LUR vs. MM distributions NO2}
+RPvMM_dist_no2<- ggplot(grid_full %>% 
+         dplyr::select(c("NO2","NO2_CACES")) %>% 
+         pivot_longer(cols = c("NO2","NO2_CACES"), names_to = "pollutant")) +
+  geom_density(aes(x=value,fill=pollutant), alpha=.25)
+# ggsave("../Graphics/Scatter and distribution/RPvMM_dist_no2.pdf",
+#        RPvMM_dist_no2, units = "in", height = 1, width = 3, scale = 2)
+```
+
+```{r UFP scatter}
+UFP_scatter <- ggplot(grid_full, aes(x = UFP_CACES, y = UFP)) +
+  geom_point(color = "#5ab4ac", alpha = .4, size = .2) +
+  # geom_smooth(method='lm') +
+  geom_abline(slope=1, intercept=0) +
+  # xlim(range(grid_full$UFP, na.rm = T)) +
+  # ylim(range(grid_full$UFP, na.rm = T)) +
+  xlim(c(0,125)) +
+  ylim(c(0,125)) +
+  theme(aspect.ratio = 1)
+
+RPvMM_scatter_UFP <- ggMarginal(UFP_scatter, type="density")
+summary(lm(data=grid_full, formula = UFP~UFP_CACES))
+
+# ggsave("../Graphics/Scatter and distribution/RPvMM_scatter_UFP.pdf",
+#        RPvMM_scatter_UFP, units = "in", height = 3, width = 3, scale = 1)
+```
+
+```{r LUR vs. MM distributions UFP}
+RPvMM_dist_UFP <- ggplot(grid_full %>% 
+         dplyr::select(c("UFP","UFP_CACES")) %>% 
+         pivot_longer(cols = c("UFP","UFP_CACES"), names_to = "pollutant")) +
+  geom_density(aes(x=value,fill=pollutant), alpha=.25) +
+  xlim(c(0,100))
+# ggsave("../Graphics/Scatter and distribution/RPvMM_dist_UFP.pdf",
+#        RPvMM_dist_UFP, units = "in", height = 1, width = 3, scale = 2)
+```
+
+###1.2 Structure of localized difference
+
+```{r density plot of NO2 LD}
+error_scatter <- ggplot(grid_full, aes(x=NO2_CACES, y=NO2_error)) +
+    stat_density_2d(aes(fill = ..level..), geom = "polygon", bins = 20) +
+  # ylim(c(min(grid_full$NO2_error),100)) +
+  scale_fill_continuous("density", type = "viridis") +
+  geom_point(alpha = 0) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(angle = 90, hjust = 1))
+
+
+LD_dens_no2 <- ggMarginal(error_scatter, type="density")
+# ggMarginal(error_scatter, type="boxplot")
+
+grid_full %>% 
+  mutate(target=NO2_error) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            min = min(target),
+            max = max(target),
+            tenth = quantile(target,.05),
+            ninetieth = quantile(target,.95))
+# ggsave("../Graphics/Scatter and distribution/LD_dens_no2.pdf",
+#        LD_dens_no2, units = "in", height = 3, width = 3, scale = 1)
+
+```
+
+```{r density plot of UFP error}
+error_scatter <- ggplot(grid_full, aes(x=UFP_CACES, y=UFP_error)) +
+    stat_density_2d(aes(fill = ..level..), geom = "polygon", bins = 20) +
+    # geom_hex(bins = 80) +
+  ylim(c(min(grid_full$UFP_error),100)) +
+  scale_fill_continuous("density", type = "viridis") +
+  geom_point(alpha = 0) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(angle = 90, hjust = 1))
+
+
+LD_dens_UFP <- ggMarginal(error_scatter, type="density")
+# ggMarginal(error_scatter, type="boxplot")
+
+grid_full %>% 
+  mutate(target=UFP_error) %>% 
+  select(target) %>% 
+  na.omit() %>% 
+  summarise(mean = mean(target),
+            median = median(target),
+            IQR = quantile(target,.75)-quantile(target,.25),
+            min = min(target),
+            max = max(target),
+            tenth = quantile(target,.05),
+            ninetieth = quantile(target,.95))
+# ggsave("../Graphics/Scatter and distribution/LD_dens_UFP.pdf",
+#        LD_dens_UFP, units = "in", height = 3, width = 3, scale = 1)
+
+```
+```{r map of LD by neighborhood 1}
+all_nbhd_bounds <- grid_full %>% 
+  group_by(neighborhood) %>% 
+  summarize()
+
+nbhd_names <- unique(all_nbhd_bounds$neighborhood)
+```
+
+```{r set up full domain map of LD}
+
+all_nbhd_bounds <- grid_full %>% 
+  group_by(neighborhood) %>% 
+  summarize()
+
+NeiColorFull = c('#911eb4', '#9A6324','#659EC7','#000075',
+                 '#808000','#42d4f4','#3cb44b','#800000',
+                 '#f58231','#ffe119','#ffd8b1','#fffac8',
+                 '#bfef45','#e6194b','#fabed4','#FAAFBE',
+                 '#f032e6','#4363d8')
+nbhdSort = c(13,7,14,16,17,1,3,18,4,6,8,9,10)
+NeiColorMain <- NeiColorFull[nbhdSort]
+  
+# mainGroup = as.factor(c("Berkeley","Downtown Oakland","East Oakland","Inner Oakland","Livermore",
+#            "Millbrae","Palo Alto","Redwood City","Sebastopol","SF Financial","SF Ocean","SF Richmond" ,"West Oakland"))
+
+mainGroup = as.factor(c("Sebastopol","Livermore","SF Financial","SF Ocean","SF Richmond",
+                        "Berkeley","Downtown Oakland","West Oakland","East Oakland","Inner Oakland",
+                        "Millbrae","Palo Alto","Redwood City"))
+
+all_nbhd_bounds$neighborhood <- factor(all_nbhd_bounds$neighborhood, levels = mainGroup)
+```
+
+
+```{r map of NO2 error}
+quantile(grid_full$NO2_error, probs = seq(0,1,.1), na.rm = T)
+error_breaks = c(-12.1,seq(-7.5,15,2.5),29)
+
+full_NO2_LD_map <- ggmap(GSV_bgkdmap) +
+    geom_sf(data = all_nbhd_bounds, aes(col = neighborhood), lwd = 2,
+            fill = NA, inherit.aes = F) + 
+    scale_color_manual(values=NeiColorMain)+
+    geom_sf(data = grid_full %>% 
+      mutate(data_bin = cut(NO2_error, breaks = error_breaks, include.lowest = T)), 
+      aes(fill = data_bin), alpha = .95, lwd = 0, color = NA, inherit.aes = F)+
+      scale_fill_brewer( name = "NO2 LD",
+                       type = "div",
+                       direction = -1,
+                       palette = "Spectral") +
+      theme(axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            axis.title = element_blank())
+
+# ggsave("../Graphics/Maps/LD_NO2_full.pdf",
+#        full_NO2_LD_map)
+```
+
+```{r map of UFP error}
+quantile(grid_full$UFP_error, probs = seq(0,1,.1), na.rm = T)
+error_breaks = c(-10,seq(-3,18,3),30,281)
+
+full_UFP_LD_map <- ggmap(GSV_bgkdmap) +
+    geom_sf(data = all_nbhd_bounds, aes(col = neighborhood), lwd = 2,
+            fill = NA, inherit.aes = F) + 
+    scale_color_manual(values=NeiColorMain)+
+  geom_sf(data = grid_full %>% 
+            mutate(data_bin = cut(UFP_error, breaks = error_breaks, include.lowest = T)), 
+          aes(fill = data_bin), alpha = .95, lwd = 0, color = NA, inherit.aes = F)+
+  scale_fill_brewer( name = "UFP LD",
+                     type = "div",
+                     direction = -1,
+                     palette = "Spectral") +
+      theme(axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            axis.title = element_blank())
+
+# ggsave("../Graphics/Maps/LD_UFP_full.pdf",
+#        full_UFP_LD_map)
+```
+
+
+
+```{r map of LD by neighborhood loop}
+nbhd_choice <- nbhd_names[1]
+
+mainGroup = as.factor(c("Sebastopol","Livermore","SF Financial","SF Ocean","SF Richmond",
+                        "Berkeley","Downtown Oakland","West Oakland","East Oakland","Inner Oakland",
+                        "Millbrae","Palo Alto","Redwood City"))
+
+all_nbhd_bounds$neighborhood <- factor(all_nbhd_bounds$neighborhood, levels = mainGroup)
+
+
+for(nbhd_loop in 1:length(mainGroup)){
+  nbhd_choice <- mainGroup[nbhd_loop]
+  
+  nbhd_bounds <- st_bbox(all_nbhd_bounds %>% 
+                           filter(neighborhood %in% nbhd_choice))
+  nbhd_bkgdmap <- get_stamenmap(bbox=c(left = as.numeric(nbhd_bounds$xmin),
+                                   bottom = as.numeric(nbhd_bounds$ymin),
+                                   right = as.numeric(nbhd_bounds$xmax),
+                                   top = as.numeric(nbhd_bounds$ymax)),
+                            zoom = 13,
+                            maptype = "toner")
+  no2_ld_breaks = c(-12.1,seq(-7.5,15,2.5),29)
+  ufp_ld_breaks = c(-10,seq(-3,18,3),30,281)
+
+  no2_ld_nbhd <- ggmap(nbhd_bkgdmap) +
+    geom_sf(data = grid_full %>%
+              filter(neighborhood %in% nbhd_choice) %>% 
+              mutate(data_bin = cut(NO2_error, breaks = no2_ld_breaks, include.lowest = T)), 
+            aes(fill = data_bin), alpha = .95, lwd = 0, color = NA, inherit.aes = F) +
+    scale_fill_brewer( name = "NO2 LD",
+                       type = "div",
+                       direction = -1,
+                       palette = "Spectral") +  
+    geom_sf(data = all_nbhd_bounds %>%
+              filter(neighborhood %in% nbhd_choice),
+            col = NeiColorMain[nbhd_loop], lwd = 1,
+            fill = NA, inherit.aes = F) +
+    ggtitle(nbhd_choice) +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank())
+
+  ggsave(paste0("../Graphics/Maps/LD_no2_",nbhd_choice,".pdf"),
+       no2_ld_nbhd)
+
+  ufp_ld_nbhd <- ggmap(nbhd_bkgdmap) +
+    geom_sf(data = grid_full %>%
+              filter(neighborhood %in% nbhd_choice) %>%
+              mutate(data_bin = cut(UFP_error, breaks = ufp_ld_breaks, include.lowest = T)),
+            aes(fill = data_bin), alpha = .95, lwd = 0, color = NA, inherit.aes = F) +
+    scale_fill_brewer( name = "UFP LD",
+                       type = "div",
+                       direction = -1,
+                       palette = "Spectral") +  
+    geom_sf(data = all_nbhd_bounds %>%
+              filter(neighborhood %in% nbhd_choice),
+            col = NeiColorMain[nbhd_loop], lwd = 1,
+            fill = NA, inherit.aes = F) +
+    ggtitle(nbhd_choice) +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank())
+
+  ggsave(paste0("../Graphics/Maps/LD_ufp_",nbhd_choice,".pdf"),
+       ufp_ld_nbhd)
+}
+
+```
+
+
+##Results 2: Predicting spatial patterns with BART and KLS 
+
+###First, set up new parameters for BART
+```{r clear and load clean workspace}
+rm(list=ls()) 
+gc()
+load("./bartMachine R objects/clean_workspace.RData")
+```
+
+```{r expanded BART parameters}
+options(java.parameters = "-Xmx5g")
+library(bartMachine)
+
+tmp = grid_full %>% 
+       dplyr::select("index") %>% 
+       st_centroid(.) %>% 
+       st_transform(., crs = st_crs(4326)) %>% 
+       st_coordinates(.)
+grid_full$CenterX = tmp[,"X"]
+grid_full$CenterY = tmp[,"Y"]
+
+train_data <- grid_full %>% 
+  mutate(pct_WNH = ifelse(Total==0,0,WNH_pop/Total),
+         pct_BNH = ifelse(Total==0,0,BNH_pop/Total),
+         pct_HL = ifelse(Total==0,0,HL_pop/Total),
+         pct_Asn = ifelse(Total==0,0,Asn_pop/Total),
+         pct_Oth = ifelse(Total==0,0,Other_pop/Total)
+         )%>% 
+  na.omit() %>% 
+  mutate(z_WNH = ifelse(pct_WNH==0, 0, (pct_WNH-mean(pct_WNH))/sd(pct_WNH)),
+         z_BNH = ifelse(pct_BNH==0, 0, (pct_BNH-mean(pct_BNH))/sd(pct_BNH)),
+         z_HL = ifelse(pct_HL==0, 0, (pct_HL-mean(pct_HL))/sd(pct_HL)),
+         z_Asn = ifelse(pct_Asn==0, 0, (pct_Asn-mean(pct_Asn))/sd(pct_Asn)),
+         z_Oth = ifelse(pct_Oth==0, 0, (pct_Oth-mean(pct_Oth))/sd(pct_Oth)),
+         z_Tot = ifelse(Total==0, 0, (Total-mean(Total))/sd(Total))) %>%
+  dplyr::select(index, NO2, UFP,
+               z_Tot,
+               z_WNH,
+               z_BNH,
+               z_HL,
+               z_Asn,
+               z_Oth,
+               dens_buff50_food_points, 
+               dens_buff150_food_points, 
+               dens_buff300_food_points, 
+               dens_buff50_gas_points, 
+               dens_buff150_gas_points, 
+               dens_buff300_gas_points, 
+               dens_buff50_industrial_polygons, 
+               dens_buff150_industrial_polygons, 
+               dens_buff300_industrial_polygons, 
+               dens_buff50_hwy_lines, 
+               dens_buff150_hwy_lines, 
+               dens_buff300_hwy_lines, 
+               dens_buff50_onr_lines, 
+               dens_buff150_onr_lines, 
+               dens_buff300_onr_lines, 
+               dens_buff50_res_lines, 
+               dens_buff150_res_lines, 
+               dens_buff300_res_lines,
+               dens_buff50_art_lines, 
+               dens_buff150_art_lines, 
+               dens_buff300_art_lines,
+               NO2_CACES,
+               UFP_CACES,
+               CenterX,
+               CenterY
+               ) %>%   
+  mutate(NO2_error = NO2-NO2_CACES,
+         UFP_error = UFP-UFP_CACES) %>% 
+  dplyr::rename(food_50m = "dens_buff50_food_points",
+  food_150m = "dens_buff150_food_points",
+  food_300m = "dens_buff300_food_points",
+  gas_50m = "dens_buff50_gas_points",
+  gas_150m = "dens_buff150_gas_points",
+  gas_300m = "dens_buff300_gas_points",
+  ind_50m = "dens_buff50_industrial_polygons",
+  ind_150m = "dens_buff150_industrial_polygons",
+  ind_300m = "dens_buff300_industrial_polygons",
+  hwy_50m = "dens_buff50_hwy_lines",
+  hwy_150m = "dens_buff150_hwy_lines",
+  hwy_300m = "dens_buff300_hwy_lines",
+  onr_50m = "dens_buff50_onr_lines",
+  onr_150m = "dens_buff150_onr_lines",
+  onr_300m = "dens_buff300_onr_lines",
+  res_50m = "dens_buff50_res_lines",
+  res_150m = "dens_buff150_res_lines",
+  res_300m = "dens_buff300_res_lines",
+  art_50m = "dens_buff50_art_lines",
+  art_150m = "dens_buff150_art_lines",
+  art_300m = "dens_buff300_art_lines")
+```
+### Define PDP functions
+```{r modify pd_plot function}
+pd_plot_mod <- function(bart_machine, j, 
+                        levs = c(0, seq(from = 0.1, to = 0.9, by = 0.1),
+                                 1),
+                        lower_ci = 0.025, upper_ci = 0.975, prop_data = 1) 
+{
+    # check_serialization(bart_machine)
+    if (class(j) == "integer") {
+        j = as.numeric(j)
+    }
+    if (class(j) == "numeric" && (j < 1 || j > bart_machine$p)) {
+        stop(paste("You must set j to a number between 1 and p =", 
+            bart_machine$p))
+    }
+    else if (class(j) == "character" && !(j %in% bart_machine$training_data_features)) {
+        stop("j must be the name of one of the training features (see \"<bart_model>$training_data_features\")")
+    }
+    else if (!(class(j) == "numeric" || class(j) == "character")) {
+        stop("j must be a column number or column name")
+    }
+    x_j = bart_machine$model_matrix_training_data[, j]
+    if (length(unique(na.omit(x_j))) <= 1) {
+        warning("There must be more than one unique value in this training feature. PD plot not generated.")
+        return()
+    }
+    x_j_quants = unique(quantile(x_j, levs, na.rm = TRUE))
+    if (length(unique(x_j_quants)) <= 1) {
+        warning("There must be more than one unique value among the quantiles selected. PD plot not generated.")
+        return()
+    }
+    
+    n_pd_plot = round(bart_machine$n * prop_data)
+    bart_predictions_by_quantile = array(NA, c(length(x_j_quants), 
+        n_pd_plot, bart_machine$num_iterations_after_burn_in))
+    for (q in 1:length(x_j_quants)) {
+        indices = sample(1:bart_machine$n, n_pd_plot)
+        test_data = bart_machine$X[indices, ]
+        test_data[, j] = rep(x_j_quants[q], n_pd_plot)
+        bart_predictions_by_quantile[q, , ] = bart_machine_get_posterior(bart_machine, 
+            test_data)$y_hat_posterior_samples
+        cat(".")
+    }
+    cat("\n")
+    if (bart_machine$pred_type == "classification") {
+        bart_predictions_by_quantile = qnorm(bart_predictions_by_quantile)
+    }
+    bart_avg_predictions_by_quantile_by_gibbs = array(NA, c(length(x_j_quants), 
+        bart_machine$num_iterations_after_burn_in))
+    for (q in 1:length(x_j_quants)) {
+        for (g in 1:bart_machine$num_iterations_after_burn_in) {
+            bart_avg_predictions_by_quantile_by_gibbs[q, g] = mean(bart_predictions_by_quantile[q, 
+                , g])
+        }
+    }
+    bart_avg_predictions_by_quantile = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                             1, mean)
+    bart_avg_predictions_lower = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = lower_ci)
+    bart_avg_predictions_upper = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = upper_ci)
+    var_name = ifelse(class(j) == "character", j, bart_machine$training_data_features[j])
+    ylab_name = ifelse(bart_machine$pred_type == "classification", 
+                       "Partial Effect (Probits)", "Partial Effect")
+    
+    plot(x_j_quants, bart_avg_predictions_by_quantile, type = "o", 
+        main = "Partial Dependence Plot", 
+        ylim = c(min(bart_avg_predictions_lower, bart_avg_predictions_upper),
+                 max(bart_avg_predictions_lower, bart_avg_predictions_upper)),
+        ylab = ylab_name, xlab = paste(var_name, "plotted at specified quantiles"))
+    polygon(c(x_j_quants, rev(x_j_quants)), c(bart_avg_predictions_upper, 
+        rev(bart_avg_predictions_lower)), col = "gray87", border = NA)
+    lines(x_j_quants, bart_avg_predictions_lower, type = "o", 
+        col = "blue", lwd = 1)
+    lines(x_j_quants, bart_avg_predictions_upper, type = "o", 
+        col = "blue", lwd = 1)
+    lines(x_j_quants, bart_avg_predictions_by_quantile, type = "o", 
+        lwd = 2)
+    
+    # invisible(list(x_j_quants = x_j_quants, bart_avg_predictions_by_quantile = bart_avg_predictions_by_quantile, 
+    #     prop_data = prop_data))
+    list(x_j_quants = x_j_quants, 
+         bart_avg_predictions_lower = bart_avg_predictions_lower,
+         bart_avg_predictions_upper = bart_avg_predictions_upper,
+         bart_avg_predictions_by_quantile = bart_avg_predictions_by_quantile
+         # prop_data = prop_data
+         )
+
+}
+
+```
+
+```{r modify pd_plot function for 95th pctl}
+pd_plot_mean_95th <- function(bart_machine, j, 
+                        levs = c(0, seq(from = 0.1, to = 0.9, by = 0.1),
+                                 1),
+                        lower_ci = 0.025, upper_ci = 0.975, prop_data = 1) 
+{
+    # check_serialization(bart_machine)
+    if (class(j) == "integer") {
+        j = as.numeric(j)
+    }
+    if (class(j) == "numeric" && (j < 1 || j > bart_machine$p)) {
+        stop(paste("You must set j to a number between 1 and p =", 
+            bart_machine$p))
+    }
+    else if (class(j) == "character" && !(j %in% bart_machine$training_data_features)) {
+        stop("j must be the name of one of the training features (see \"<bart_model>$training_data_features\")")
+    }
+    else if (!(class(j) == "numeric" || class(j) == "character")) {
+        stop("j must be a column number or column name")
+    }
+    x_j = bart_machine$model_matrix_training_data[, j]
+    if (length(unique(na.omit(x_j))) <= 1) {
+        warning("There must be more than one unique value in this training feature. PD plot not generated.")
+        return()
+    }
+    x_j_quants = unique(quantile(x_j, levs, na.rm = TRUE))
+    if (length(unique(x_j_quants)) <= 1) {
+        warning("There must be more than one unique value among the quantiles selected. PD plot not generated.")
+        return()
+    }
+    
+    n_pd_plot = round(bart_machine$n * prop_data)
+    bart_predictions_by_quantile = array(NA, c(length(x_j_quants), 
+        n_pd_plot, bart_machine$num_iterations_after_burn_in))
+    for (q in 1:length(x_j_quants)) {
+        indices = sample(1:bart_machine$n, n_pd_plot)
+        test_data = bart_machine$X[indices, ]
+        test_data[, j] = rep(x_j_quants[q], n_pd_plot)
+        bart_predictions_by_quantile[q, , ] = bart_machine_get_posterior(bart_machine, 
+            test_data)$y_hat_posterior_samples
+        cat(".")
+    }
+    cat("\n")
+    if (bart_machine$pred_type == "classification") {
+        bart_predictions_by_quantile = qnorm(bart_predictions_by_quantile)
+    }
+    bart_avg_predictions_by_quantile_by_gibbs = array(NA, c(length(x_j_quants), 
+        bart_machine$num_iterations_after_burn_in))
+    bart_95th_predictions_by_quantile_by_gibbs = array(NA, c(length(x_j_quants), 
+        bart_machine$num_iterations_after_burn_in))
+    for (q in 1:length(x_j_quants)) {
+        for (g in 1:bart_machine$num_iterations_after_burn_in) {
+          ###THIS IS WHERE I CHANGED IT FROM MEAN TO 95th PERCENTILE
+          ##I DIDN'T CHANGE THE VARIABLE NAME YET
+            bart_avg_predictions_by_quantile_by_gibbs[q, g] = mean(bart_predictions_by_quantile[q, 
+                , g])
+            bart_95th_predictions_by_quantile_by_gibbs[q, g] = quantile(bart_predictions_by_quantile[q, 
+                , g], probs = 0.95)
+        }
+    }
+    bart_avg_predictions_by_quantile = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                             1, mean)
+    bart_avg_predictions_lower = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = lower_ci)
+    bart_avg_predictions_upper = apply(bart_avg_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = upper_ci)
+    
+    bart_95th_predictions_by_quantile = apply(bart_95th_predictions_by_quantile_by_gibbs, 
+                                             1, mean)
+    bart_95th_predictions_lower = apply(bart_95th_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = lower_ci)
+    bart_95th_predictions_upper = apply(bart_95th_predictions_by_quantile_by_gibbs, 
+                                       1, quantile, probs = upper_ci)
+    
+    var_name = ifelse(class(j) == "character", j, bart_machine$training_data_features[j])
+    ylab_name = ifelse(bart_machine$pred_type == "classification", 
+                       "Partial Effect (Probits)", "Partial Effect")
+    
+    # plot(x_j_quants, bart_avg_predictions_by_quantile, type = "o", 
+    #     main = "Partial Dependence Plot", 
+    #     ylim = c(min(bart_avg_predictions_lower, bart_avg_predictions_upper),
+    #              max(bart_avg_predictions_lower, bart_avg_predictions_upper)),
+    #     ylab = ylab_name, xlab = paste(var_name, "plotted at specified quantiles"))
+    # polygon(c(x_j_quants, rev(x_j_quants)), c(bart_avg_predictions_upper, 
+    #     rev(bart_avg_predictions_lower)), col = "gray87", border = NA)
+    # lines(x_j_quants, bart_avg_predictions_lower, type = "o", 
+    #     col = "blue", lwd = 1)
+    # lines(x_j_quants, bart_avg_predictions_upper, type = "o", 
+    #     col = "blue", lwd = 1)
+    # lines(x_j_quants, bart_avg_predictions_by_quantile, type = "o", 
+    #     lwd = 2)
+    
+    # invisible(list(x_j_quants = x_j_quants, bart_avg_predictions_by_quantile = bart_avg_predictions_by_quantile, 
+    #     prop_data = prop_data))
+    list(x_j_quants = x_j_quants, 
+         bart_avg_predictions_lower = bart_avg_predictions_lower,
+         bart_avg_predictions_upper = bart_avg_predictions_upper,
+         bart_avg_predictions_by_quantile = bart_avg_predictions_by_quantile,
+         bart_95th_predictions_lower = bart_95th_predictions_lower,
+         bart_95th_predictions_upper = bart_95th_predictions_upper,
+         bart_95th_predictions_by_quantile = bart_95th_predictions_by_quantile
+         # prop_data = prop_data
+         )
+
+}
+
+```
+
+```{r define make PDP table function}
+make_PDP_table <- function(BARTM,
+                           pct_levs = c(0,0.05, 
+                                        seq(from = 0.1, to = 0.9, by = 0.1),
+                                        0.95,1),
+                           model_x_columns,
+                           pdp_FUN){
+  for(col_choice in 1:length(model_x_columns)){
+    pdp_output <- pdp_FUN(BARTM, levs = pct_levs, j = col_choice)
+    
+    x_j = BARTM$model_matrix_training_data[, col_choice]
+    x_j_quants = quantile(x_j, pct_levs,na.rm = TRUE)
+    
+    PDP_table <- tibble( z_pctl = pdp_output$x_j_quants,
+                         LD_avg_med = pdp_output$bart_avg_predictions_by_quantile,
+                         LD_avg_low = pdp_output$bart_avg_predictions_lower,
+                         LD_avg_upp = pdp_output$bart_avg_predictions_upper,
+                         LD_95th_med = pdp_output$bart_95th_predictions_by_quantile,
+                         LD_95th_low = pdp_output$bart_95th_predictions_lower,
+                         LD_95th_upp = pdp_output$bart_95th_predictions_upper)
+    
+    PDP_table <- tibble( pct_vals = pct_levs,
+                         z_pctl = x_j_quants) %>% 
+      left_join(., PDP_table, by="z_pctl") %>% 
+      mutate(kls = rep(model_x_columns[col_choice], length(pct_levs)))
+    
+    if(col_choice == 1){
+      PDP_table_all <- PDP_table
+    }else{
+      PDP_table_all <- rbind(PDP_table_all, PDP_table)
+    }
+  }
+return(PDP_table_all)
+}
+```
+
+```{r define make PDP graphics function}
+make_PDP_graphics <- function(PDP_table,
+                              PDP_limits_table,
+                              which_stat = c("mean","95th"),
+                              x_cols,
+                              y_axis_name,
+                              save_location,
+                              pollutant = c("NO2","UFP")
+                              ){
+  
+  if(which_stat == "mean"){
+      PDP_table_graphics <- PDP_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_avg_med,
+               LD_upp = LD_avg_upp,
+               LD_low = LD_avg_low)
+      
+      PDP_table_lims <- PDP_limits_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_avg_med,
+               LD_upp = LD_avg_upp,
+               LD_low = LD_avg_low)
+      global_y_limits = c(min(PDP_table_lims$LD_low), max(PDP_table_lims$LD_upp))
+      
+  }else if(which_stat == "95th"){
+      PDP_table_graphics <- PDP_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_95th_med,
+               LD_upp = LD_95th_upp,
+               LD_low = LD_95th_low)
+      
+      PDP_table_lims <- PDP_limits_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_95th_med,
+               LD_upp = LD_95th_upp,
+               LD_low = LD_95th_low)
+      global_y_limits = c(min(PDP_table_lims$LD_low), max(PDP_table_lims$LD_upp))    
+  }
+
+  for(graph_col in 1:length(x_cols)){
+    PDP_ggplot <- ggplot(PDP_table_graphics %>% 
+             filter(kls == x_cols[graph_col])) +
+        geom_line(aes(x=pct_vals, y=LD_med)) +
+        # geom_line(aes(x=pct_vals, y=LD_upp)) +
+        # geom_line(aes(x=pct_vals, y=LD_low)) +
+        geom_ribbon(aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5) +
+        scale_y_continuous(limits = global_y_limits, name = y_axis_name) +
+        scale_x_continuous(breaks = c(0.05, seq(from = 0.1, to = 0.9, by = 0.1),0.95),
+                           name = "Percentile") +
+    theme(axis.text.x.bottom = element_text(angle = 60, hjust = 1))
+    
+  ggsave(paste0(save_location,"/",pollutant,"_",x_cols[graph_col],".pdf"),
+         PDP_ggplot, units = "in", width = 1.3, height = 1, scale = 1.75)
+  }
+}
+```
+
+```{r alter make PDP fn for y lim}
+make_PDP_graphics_set_y_lim <- function(PDP_table,
+                              ylim,
+                              which_stat = c("mean","95th"),
+                              x_cols,
+                              y_axis_name,
+                              save_location,
+                              pollutant = c("NO2","UFP")
+                              ){
+  
+  if(which_stat == "mean"){
+      PDP_table_graphics <- PDP_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_avg_med,
+               LD_upp = LD_avg_upp,
+               LD_low = LD_avg_low)
+      
+      global_y_limits = ylim
+      
+  }else if(which_stat == "95th"){
+      PDP_table_graphics <- PDP_table %>% 
+        filter(pct_vals >0 & pct_vals <1) %>% 
+        mutate(LD_med = LD_95th_med,
+               LD_upp = LD_95th_upp,
+               LD_low = LD_95th_low)
+      
+      global_y_limits = ylim
+  }
+
+  for(graph_col in 1:length(x_cols)){
+    PDP_ggplot <- ggplot(PDP_table_graphics %>% 
+             filter(kls == x_cols[graph_col])) +
+        geom_line(aes(x=pct_vals, y=LD_med)) +
+        # geom_line(aes(x=pct_vals, y=LD_upp)) +
+        # geom_line(aes(x=pct_vals, y=LD_low)) +
+        geom_ribbon(aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5) +
+        scale_y_continuous(name = y_axis_name) +
+        coord_cartesian(ylim=global_y_limits) +
+        scale_x_continuous(breaks = c(0.05, seq(from = 0.1, to = 0.9, by = 0.1),0.95),
+                           name = "Percentile") +
+    theme(axis.text.x.bottom = element_text(angle = 60, hjust = 1))
+    
+  ggsave(paste0(save_location,"/",pollutant,"_",x_cols[graph_col],".pdf"),
+         PDP_ggplot, units = "in", width = 1.3, height = 1, scale = 1.75)
+  }
+}
+```
+
+
+```{r}
+save.image("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+#####Run BART
+
+```{r}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+###2.1 Model 1: error \~ OSM ####Model 1 for NO2
+
+```{r m1 setup}
+m1_x_cols <- c("food_50m",
+  "food_150m",
+  "food_300m",
+  "gas_50m",
+  "gas_150m",
+  "gas_300m",
+  "ind_50m",
+  "ind_150m",
+  "ind_300m",
+  "hwy_50m",
+  "hwy_150m",
+  "hwy_300m",
+  "onr_50m",
+  "onr_150m",
+  "onr_300m",
+  "res_50m",
+  "res_150m",
+  "res_300m",
+  "art_50m",
+  "art_150m",
+  "art_300m"
+)
+```
+
+```{r m1 no2 setup}
+y <- train_data %>% 
+  pull(NO2_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m1_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m1 no2 run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 16000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 1/BART_summary_NO2_vl.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 1/BART_convergence_NO2_vl.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m1_no2 <- bart_machine
+```
+
+
+```{r m1 no2 save BART}
+# saveRDS(bart_machine_m1_no2,
+#         "../Updated BART outputs/bartMachine R objects/bart_machine_m1_no2.RDS")
+save.image("../Updated BART outputs/bartMachine R objects/BART_m1_no2.RData")
+```
+
+```{r}
+load("../Updated BART outputs/bartMachine R objects/BART_m1_no2.RData")
+```
+
+#####Examining BART predictions and residuals
+
+```{r}
+BART_plot_data = data.frame(
+  LD_train = bart_machine_m1_no2$y,
+  LD_predicted = bart_machine_m1_no2$y_hat_train
+)
+
+BART_scatter <- ggplot(BART_plot_data, aes(x=LD_predicted, y=LD_train)) +
+    geom_point(color = "#5c2d91", alpha = .4, size = .2) +
+  # geom_smooth(method='lm') +
+  geom_abline(slope=1, intercept=0) +
+  scale_x_continuous(name="Predicted NO2 LD",
+                     limits=range(BART_plot_data$LD_train, na.rm = T)) +
+  scale_y_continuous(name="Observed NO2 LD",
+                     limits=range(BART_plot_data$LD_train, na.rm = T)) +
+  theme(aspect.ratio = 1)
+
+LDpred_scatter_no2 <- ggMarginal(BART_scatter, type="density")
+
+ggsave("../Graphics/Scatter and distribution/LDpred_scatter_no2.pdf",
+      LDpred_scatter_no2, units = "in", height = 3, width = 3, scale = 1)
+
+NO2_summary <- summary(lm(data=BART_plot_data, formula=LD_train~LD_predicted ))
+NO2_summary$sigma/mean(BART_plot_data$LD_train)
+
+LDpred_dens_no2 <- ggplot(BART_plot_data %>%  
+         pivot_longer(cols = c("LD_predicted","LD_train"), names_to = "LD")) +
+  geom_density(aes(x=value,fill=LD), alpha=.25) +
+  theme(legend.position = "none")
+ggsave("../Graphics/Scatter and distribution/LDpred_dens_no2.pdf",
+       LDpred_dens_no2, units = "in", height = 1, width = 3, scale = 2)
+  
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m1 no2 variable selection}
+pdf("../Updated BART outputs/Model 1/variable_selection_NO2_vl.pdf")
+vs <- var_selection_by_permute(bart_machine_m1_no2, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots::UPDATED
+```{r m1 no2 pdp table make}
+PDP_table_NO2_m1 <-make_PDP_table(BARTM = bart_machine_m1_no2,
+                                  model_x_columns = m1_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+```{r just for checking new fn}
+check_PDP_table_NO2_m1 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP_table_NO2_m1.RDS")
+```
+
+
+```{r m1 no2 PDP table save}
+# saveRDS(PDP_table_NO2_m1,
+#         "../Updated BART outputs/bartMachine R objects/PDP tables/m1_NO2.RDS")
+```
+
+
+```{r m1 no2 PDP graphics}
+PDP_table_NO2_m1 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m1_NO2.RDS")
+
+make_PDP_graphics(PDP_table = PDP_table_NO2_m1,
+                  PDP_limits_table = PDP_table_NO2_m1,
+                  which_stat = "mean",
+                  x_cols = m1_x_cols,
+                  y_axis_name = "Predicted mean NO2 LD",
+                  save_location = "../Graphics/model 1 PDPs/means/",
+                  pollutant = "NO2")
+
+make_PDP_graphics(PDP_table = PDP_table_NO2_m1,
+                  PDP_limits_table = PDP_table_NO2_m1,
+                  which_stat = "95th",
+                  x_cols = m1_x_cols,
+                  y_axis_name = "Predicted 95th NO2 LD",
+                  save_location = "../Graphics/model 1 PDPs/95th pctl/",
+                  pollutant = "NO2")
+```
+
+
+####Model 1 for UFP
+```{r}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+```{r m1 setup}
+m1_x_cols <- c("food_50m",
+  "food_150m",
+  "food_300m",
+  "gas_50m",
+  "gas_150m",
+  "gas_300m",
+  "ind_50m",
+  "ind_150m",
+  "ind_300m",
+  "hwy_50m",
+  "hwy_150m",
+  "hwy_300m",
+  "onr_50m",
+  "onr_150m",
+  "onr_300m",
+  "res_50m",
+  "res_150m",
+  "res_300m",
+  "art_50m",
+  "art_150m",
+  "art_300m"
+)
+```
+
+```{r m1 UFP setup}
+y <- train_data %>% 
+  pull(UFP_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m1_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m1 UFP run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 16000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 1/BART_summary_UFP_vl.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 1/BART_convergence_UFP_vl.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m1_ufp <- bart_machine
+```
+
+```{r m1 UFP save BART}
+# save.image("../Updated BART outputs/bartMachine R objects/BART_m1_ufp.RData")
+load("../Updated BART outputs/bartMachine R objects/BART_m1_ufp.RData")
+```
+
+#####Examining BART predictions and residuals
+
+```{r}
+BART_plot_data = data.frame(
+  LD_train = bart_machine_m1_ufp$y,
+  LD_predicted = bart_machine_m1_ufp$y_hat_train
+)
+
+BART_scatter <- ggplot(BART_plot_data, aes(x=LD_predicted, y=LD_train)) +
+    geom_point(color = "#5c2d91", alpha = .4, size = .8) +
+  # geom_smooth(method='lm') +
+  geom_abline(slope=1, intercept=0) +
+  scale_x_continuous(name="Predicted UFP LD",
+                     limits=range(BART_plot_data$LD_train, na.rm = T)) +
+  scale_y_continuous(name="Observed UFP LD",
+                     limits=range(BART_plot_data$LD_train, na.rm = T)) +
+  theme(aspect.ratio = 1)
+
+LDpred_scatter_UFP <- ggMarginal(BART_scatter, type="density")
+
+ggsave("../Graphics/Scatter and distribution/LDpred_scatter_UFP.pdf",
+      LDpred_scatter_UFP, units = "in", height = 3, width = 3, scale = 1)
+
+UFP_summary <- summary(lm(data=BART_plot_data, formula=LD_train~LD_predicted ))
+UFP_summary$sigma/mean(BART_plot_data$LD_train)
+
+
+LDpred_dens_UFP <- ggplot(BART_plot_data %>%  
+         pivot_longer(cols = c("LD_predicted","LD_train"), names_to = "LD")) +
+  geom_density(aes(x=value,fill=LD), alpha=.25) +
+  theme(legend.position = "none")
+ggsave("../Graphics/Scatter and distribution/LDpred_dens_UFP.pdf",
+       LDpred_dens_UFP, units = "in", height = 1, width = 3, scale = 2)
+
+mean(BART_plot_data$LD_predicted)
+  
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m1 UFP variable selection}
+pdf("../Updated BART outputs/Model 1/variable_selection_UFP_v2.pdf")
+vs <- var_selection_by_permute(bart_machine_m1_ufp, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots::UPDATED
+```{r m1 UFP pdp table make}
+PDP_table_UFP_m1 <-make_PDP_table(BARTM = bart_machine_m1_ufp,
+                                  model_x_columns = m1_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+
+```{r m1 UFP PDP table save}
+# saveRDS(PDP_table_UFP_m1,
+# "../Updated BART outputs/bartMachine R objects/PDP tables/m1_UFP.RDS")
+```
+
+
+```{r m1 UFP PDP graphics}
+PDP_table_UFP_m1 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m1_UFP.RDS")
+
+make_PDP_graphics_set_y_lim(PDP_table = PDP_table_UFP_m1,
+                  ylim = c(8,20),
+                  which_stat = "mean",
+                  x_cols = m1_x_cols,
+                  y_axis_name = "Predicted mean UFP LD",
+                  save_location = "../Graphics/model 1 PDPs/means/",
+                  pollutant = "UFP")
+
+make_PDP_graphics_set_y_lim(PDP_table = PDP_table_UFP_m1,
+                  ylim = c(20,45),
+                  which_stat = "95th",
+                  x_cols = m1_x_cols,
+                  y_axis_name = "Predicted 95th UFP LD",
+                  save_location = "../Graphics/model 1 PDPs/95th pctl/",
+                  pollutant = "UFP")
+```
+
+
+###Model 2: error \~ race/eth ####Model 2 for NO2
+```{r}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+
+```{r m2 setup}
+m2_x_cols <- c(
+  "z_Tot",
+  "z_WNH",
+  "z_BNH",
+  "z_HL",
+  "z_Asn",
+  "z_Oth"
+)
+```
+
+
+```{r m2 no2 setup}
+y <- train_data %>% 
+  pull(NO2_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m2_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m2 no2 run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 10000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 2/BART_summary_NO2.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 2/BART_convergence_NO2.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m2_no2 <- bart_machine
+```
+
+
+```{r m2 no2 save BART}
+save.image("../Updated BART outputs/bartMachine R objects/BART_m2_no2.RData")
+```
+
+```{r}
+BART_plot_data = data.frame(
+  LD_train = bart_machine_m2_no2$y,
+  LD_predicted = bart_machine_m2_no2$y_hat_train
+)
+summary(lm(data=BART_plot_data, formula=LD_train~LD_predicted ))
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m2 no2 variable selection}
+pdf("../Updated BART outputs/Model 2/variable_selection_NO2.pdf")
+vs <- var_selection_by_permute(bart_machine_m2_no2, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots
+```{r m2 no2 table make}
+PDP_table_NO2_m2 <-make_PDP_table(BARTM = bart_machine_m2_no2,
+                                  model_x_columns = m2_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+
+```{r m2 no2 PDP table save}
+saveRDS(PDP_table_NO2_m2,
+        "../Updated BART outputs/bartMachine R objects/PDP tables/m2_NO2.RDS")
+```
+
+```{r m2 no2 PDP graphics}
+make_PDP_graphics(PDP_table = PDP_table_NO2_m2,
+                  PDP_limits_table = PDP_table_NO2_m2,
+                  which_stat = "mean",
+                  x_cols = m2_x_cols,
+                  y_axis_name = "Predicted mean NO2 LD",
+                  save_location = "../Graphics/model 2 PDPs/means/",
+                  pollutant = "NO2")
+
+make_PDP_graphics(PDP_table = PDP_table_NO2_m2,
+                  PDP_limits_table = PDP_table_NO2_m2,
+                  which_stat = "95th",
+                  x_cols = m2_x_cols,
+                  y_axis_name = "Predicted 95th NO2 LD",
+                  save_location = "../Graphics/model 2 PDPs/95th pctl/",
+                  pollutant = "NO2")
+```
+
+####Model 2 for UFP
+```{r}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+```{r m2 setup}
+m2_x_cols <- c(
+  "z_Tot",
+  "z_WNH",
+  "z_BNH",
+  "z_HL",
+  "z_Asn",
+  "z_Oth"
+)
+```
+
+```{r m2 UFP setup}
+y <- train_data %>% 
+  pull(UFP_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m2_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m2 UFP run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 10000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 2/BART_summary_UFP.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 2/BART_convergence_UFP.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m2_UFP <- bart_machine
+```
+
+```{r m2 UFP save BART}
+# save.image("../Updated BART outputs/bartMachine R objects/BART_m2_ufp.RData")
+```
+
+```{r}
+BART_plot_data = data.frame(
+  LD_train = bart_machine_m2_UFP$y,
+  LD_predicted = bart_machine_m2_UFP$y_hat_train
+)
+summary(lm(data=BART_plot_data, formula=LD_train~LD_predicted ))
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m2 UFP variable selection}
+pdf("../Updated BART outputs/Model 2/variable_selection_UFP.pdf")
+vs <- var_selection_by_permute(bart_machine_m2_UFP, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots
+```{r m2 no2 table make}
+PDP_table_UFP_m2 <-make_PDP_table(BARTM = bart_machine_m2_UFP,
+                                  model_x_columns = m2_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+
+```{r m2 UFP PDP table save}
+# saveRDS(PDP_table_UFP_m2,
+#         "../Updated BART outputs/bartMachine R objects/PDP tables/m2_UFP.RDS")
+```
+
+```{r m2 UFP PDP graphics}
+make_PDP_graphics(PDP_table = PDP_table_UFP_m2,
+                  PDP_limits_table = PDP_table_UFP_m2,
+                  which_stat = "mean",
+                  x_cols = m2_x_cols,
+                  y_axis_name = "Predicted mean UFP LD",
+                  save_location = "../Graphics/model 2 PDPs/means/",
+                  pollutant = "UFP")
+
+make_PDP_graphics(PDP_table = PDP_table_UFP_m2,
+                  PDP_limits_table = PDP_table_UFP_m2,
+                  which_stat = "95th",
+                  x_cols = m2_x_cols,
+                  y_axis_name = "Predicted 95th UFP LD",
+                  save_location = "../Graphics/model 2 PDPs/95th pctl/",
+                  pollutant = "UFP")
+```
+
+###Model 3: error \~ OSM + race/eth ####Model 3 for NO2
+```{r load clean workspace}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+
+```{r m3 no2 setup}
+m3_x_cols <- c(
+  "z_Tot",
+  "z_WNH",
+  "z_BNH",
+  "z_HL",
+  "z_Asn",
+  "z_Oth",
+  "food_50m",
+  "food_150m",
+  "food_300m",
+  "gas_50m",
+  "gas_150m",
+  "gas_300m",
+  "ind_50m",
+  "ind_150m",
+  "ind_300m",
+  "hwy_50m",
+  "hwy_150m",
+  "hwy_300m",
+  "onr_50m",
+  "onr_150m",
+  "onr_300m",
+  "res_50m",
+  "res_150m",
+  "res_300m",
+  "art_50m",
+  "art_150m",
+  "art_300m"
+)
+
+y <- train_data %>% 
+  pull(NO2_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m3_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m3 no2 run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 11000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 3/BART_summary_NO2_vl.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 3/BART_convergence_NO2_vl.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m3_no2 <- bart_machine
+```
+
+
+```{r m3 no2 save BART}
+saveRDS(bart_machine_m3_no2,
+        "../Updated BART outputs/bartMachine R objects/bart_machine_m3_no2.RDS")
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m3 no2 variable selection}
+pdf("../Updated BART outputs/Model 3/variable_selection_NO2_vl.pdf")
+vs <- var_selection_by_permute(bart_machine_m3_no2, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots
+```{r m3 no2 table make}
+PDP_table_NO2_m3 <-make_PDP_table(BARTM = bart_machine_m3_no2,
+                                  model_x_columns = m3_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+
+```{r m3 NO2 PDP table save}
+# saveRDS(PDP_table_NO2_m3,
+#         "../Updated BART outputs/bartMachine R objects/PDP tables/m3_NO2.RDS")
+```
+
+```{r m3 NO2 PDP graphics}
+PDP_table_NO2_m2 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m2_NO2.RDS")
+PDP_table_NO2_m3 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m3_NO2.RDS")
+
+make_PDP_graphics(PDP_table = PDP_table_NO2_m3,
+                  PDP_limits_table = PDP_table_NO2_m2,
+                  which_stat = "mean",
+                  x_cols = m3_x_cols,
+                  y_axis_name = "Predicted mean NO2 LD",
+                  save_location = "../Graphics/model 3 PDPs/means/",
+                  pollutant = "NO2")
+
+make_PDP_graphics(PDP_table = PDP_table_NO2_m3,
+                  PDP_limits_table = PDP_table_NO2_m2,
+                  which_stat = "95th",
+                  x_cols = m3_x_cols,
+                  y_axis_name = "Predicted 95th NO2 LD",
+                  save_location = "../Graphics/model 3 PDPs/95th pctl/",
+                  pollutant = "NO2")
+```
+
+
+####Model 3 for UFP
+```{r load clean workspace}
+rm(list=ls()) 
+gc()
+load("../Updated BART outputs/bartMachine R objects/BART_prep_workspace.RData")
+```
+
+
+```{r m3 no2 setup}
+m3_x_cols <- c(
+  "z_Tot",
+  "z_WNH",
+  "z_BNH",
+  "z_HL",
+  "z_Asn",
+  "z_Oth",
+  "food_50m",
+  "food_150m",
+  "food_300m",
+  "gas_50m",
+  "gas_150m",
+  "gas_300m",
+  "ind_50m",
+  "ind_150m",
+  "ind_300m",
+  "hwy_50m",
+  "hwy_150m",
+  "hwy_300m",
+  "onr_50m",
+  "onr_150m",
+  "onr_300m",
+  "res_50m",
+  "res_150m",
+  "res_300m",
+  "art_50m",
+  "art_150m",
+  "art_300m"
+)
+```
+
+```{r m3 UFP setup}
+y <- train_data %>% 
+  pull(UFP_error)
+x <- train_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(all_of(m3_x_cols)) %>% 
+  as.data.frame() %>% 
+  filter(!is.na(y))
+y <- y[!is.na(y)]
+
+```
+
+#####Run BART
+
+```{r m3 UFP run BART}
+bart_machine <- bartMachine(x,y,
+                            num_trees = 100,
+                            num_burn_in = 16000,
+                            num_iterations_after_burn_in = 2000,
+                            mem_cache_for_speed = F,
+                            verbose = F)
+sink("../Updated BART outputs/Model 3/BART_summary_UFP_vl.txt")
+bart_machine
+sink()
+
+pdf("../Updated BART outputs/Model 3/BART_convergence_UFP_vl.pdf")
+plot_convergence_diagnostics(bart_machine)
+dev.off()
+
+bart_machine_m3_ufp <- bart_machine
+```
+
+
+```{r m3 UFP save BART}
+# save.image("../Updated BART outputs/bartMachine R objects/BART_m3_ufp.RData")
+```
+
+#####Variable Selection via variable importance parameter
+
+```{r m3 UFP variable selection}
+pdf("../Updated BART outputs/Model 3/variable_selection_UFP_vl.pdf")
+vs <- var_selection_by_permute(bart_machine_m3_ufp, bottom_margin = 5, 
+                               num_reps_for_avg = 25, num_permute_samples = 100)
+dev.off()
+```
+
+#####Partial dependence plots
+```{r m3 UFP PDP table make}
+PDP_table_UFP_m3 <-make_PDP_table(BARTM = bart_machine_m3_ufp,
+                                  model_x_columns = m3_x_cols,
+                                  pdp_FUN = pd_plot_mean_95th)
+```
+
+
+```{r m3 UFP PDP table save}
+saveRDS(PDP_table_UFP_m3,
+        "../Updated BART outputs/bartMachine R objects/PDP tables/m3_UFP.RDS")
+```
+
+```{r m3 UFP PDP graphics}
+PDP_table_UFP_m2 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m2_UFP.RDS")
+PDP_table_UFP_m3 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m3_UFP.RDS")
+
+make_PDP_graphics(PDP_table = PDP_table_UFP_m3,
+                  PDP_limits_table = PDP_table_UFP_m2,
+                  which_stat = "mean",
+                  x_cols = m3_x_cols,
+                  y_axis_name = "Predicted mean UFP LD",
+                  save_location = "../Graphics/model 3 PDPs/means/",
+                  pollutant = "UFP")
+
+make_PDP_graphics(PDP_table = PDP_table_UFP_m3,
+                  PDP_limits_table = PDP_table_UFP_m2,
+                  which_stat = "95th",
+                  x_cols = m3_x_cols,
+                  y_axis_name = "Predicted 95th UFP LD",
+                  save_location = "../Graphics/model 3 PDPs/95th pctl/",
+                  pollutant = "UFP")
+```
+
+
+```{r m2 and m3 PDP overlaid NO2}
+PDP_table_NO2_m2 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m2_NO2.RDS")
+PDP_table_NO2_m3 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m3_NO2.RDS")
+
+PDP_table_graphics_m2 <- PDP_table_NO2_m2 %>% 
+  filter(pct_vals >0 & pct_vals <1) %>% 
+  mutate(LD_med = LD_avg_med,
+         LD_upp = LD_avg_upp,
+         LD_low = LD_avg_low)
+PDP_table_graphics_m3 <- PDP_table_NO2_m3 %>% 
+  filter(pct_vals >0 & pct_vals <1) %>% 
+  mutate(LD_med = LD_avg_med,
+         LD_upp = LD_avg_upp,
+         LD_low = LD_avg_low)
+
+save_location = "../Graphics/model 2 3 PDP overlay/"
+pollutant = "NO2"
+x_cols = m3_x_cols
+global_y_limits = c(-4,4)
+y_axis_name = "Predicted mean NO2 LD"
+
+for(graph_col in 1:6){
+m2_3_plot <- ggplot() +
+        geom_line(data = PDP_table_graphics_m2 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, y=LD_med), color = "blue") +
+        geom_ribbon(data = PDP_table_graphics_m2 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5, fill = "blue") +
+        geom_line(data = PDP_table_graphics_m3 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, y=LD_med), color = "red") +
+        geom_ribbon(data = PDP_table_graphics_m3 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5, fill = "red") +
+        scale_y_continuous(name = y_axis_name) +
+        coord_cartesian(ylim=global_y_limits) +
+        scale_x_continuous(breaks = c(0.05, seq(from = 0.1, to = 0.9, by = 0.1),0.95),
+                           name = paste("Percentile",x_cols[graph_col])) +
+    theme(axis.text.x.bottom = element_text(angle = 60, hjust = 1))
+
+  ggsave(paste0(save_location,"/",pollutant,"_",x_cols[graph_col],".pdf"),
+         m2_3_plot, units = "in", width = 1.3, height = 1, scale = 1.75)
+}
+m2_3_plot
+```
+
+```{r m2 and m3 PDP overlaid UFP}
+PDP_table_UFP_m2 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m2_UFP.RDS")
+PDP_table_UFP_m3 <- readRDS("../Updated BART outputs/bartMachine R objects/PDP tables/m3_UFP.RDS")
+
+PDP_table_graphics_m2 <- PDP_table_UFP_m2 %>% 
+  filter(pct_vals >0 & pct_vals <1) %>% 
+  mutate(LD_med = LD_avg_med,
+         LD_upp = LD_avg_upp,
+         LD_low = LD_avg_low)
+PDP_table_graphics_m3 <- PDP_table_UFP_m3 %>% 
+  filter(pct_vals >0 & pct_vals <1) %>% 
+  mutate(LD_med = LD_avg_med,
+         LD_upp = LD_avg_upp,
+         LD_low = LD_avg_low)
+
+save_location = "../Graphics/model 2 3 PDP overlay/"
+pollutant = "UFP"
+x_cols = m3_x_cols
+global_y_limits = c(5,30)
+y_axis_name = "Predicted mean UFP LD"
+
+for(graph_col in 1:6){
+m2_3_plot <- ggplot() +
+        geom_line(data = PDP_table_graphics_m2 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, y=LD_med), color = "blue") +
+        geom_ribbon(data = PDP_table_graphics_m2 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5, fill = "blue") +
+        geom_line(data = PDP_table_graphics_m3 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, y=LD_med), color = "red") +
+        geom_ribbon(data = PDP_table_graphics_m3 %>% 
+             filter(kls == x_cols[graph_col]),
+             aes(x=pct_vals, ymin = LD_low, ymax = LD_upp), alpha = .5, fill = "red") +
+        scale_y_continuous(name = y_axis_name) +
+        coord_cartesian(ylim=global_y_limits) +
+        scale_x_continuous(breaks = c(0.05, seq(from = 0.1, to = 0.9, by = 0.1),0.95),
+                           name = paste("Percentile",x_cols[graph_col])) +
+    theme(axis.text.x.bottom = element_text(angle = 60, hjust = 1))
+
+  ggsave(paste0(save_location,"/",pollutant,"_",x_cols[graph_col],".pdf"),
+         m2_3_plot, units = "in", width = 1.3, height = 1, scale = 1.75)
+}
+m2_3_plot
+```
+
+
